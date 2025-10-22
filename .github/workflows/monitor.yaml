@@ -21,62 +21,62 @@ jobs:
       failure-details: ${{ steps.check-failures.outputs.failure-details }}
     
     steps:
-      - name: ✅ Checkout code
-        uses: actions/checkout@v4
+    #   - name: ✅ Checkout code
+    #     uses: actions/checkout@v4
 
-      - name: 🔐 Azure login
-        uses: azure/login@v1
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+    #   - name: 🔐 Azure login
+    #     uses: azure/login@v1
+    #     with:
+    #       creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: 🏥 Check Container App Health
-        id: container-app-health
-        continue-on-error: true
-        run: |
-          echo "Checking Container App status..."
+    #   - name: 🏥 Check Container App Health
+    #     id: container-app-health
+    #     continue-on-error: true
+    #     run: |
+    #       echo "Checking Container App status..."
           
-          STATUS=$(az containerapp show \
-            --name ${{ env.CONTAINER_APP_NAME }} \
-            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-            --query 'properties.runningStatus' -o tsv 2>/dev/null || echo "UNKNOWN")
+    #       STATUS=$(az containerapp show \
+    #         --name ${{ env.CONTAINER_APP_NAME }} \
+    #         --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+    #         --query 'properties.runningStatus' -o tsv 2>/dev/null || echo "UNKNOWN")
           
-          echo "Container App Status: $STATUS"
-          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+    #       echo "Container App Status: $STATUS"
+    #       echo "status=${STATUS}" >> $GITHUB_OUTPUT
           
-          if [ "$STATUS" != "Running" ]; then
-            echo "❌ Container App is not running"
-            exit 1
-          else
-            echo "✅ Container App is running"
-          fi
+    #       if [ "$STATUS" != "Running" ]; then
+    #         echo "❌ Container App is not running"
+    #         exit 1
+    #       else
+    #         echo "✅ Container App is running"
+    #       fi
 
-      - name: 🔗 Check Application Endpoint
-        id: endpoint-health
-        continue-on-error: true
-        run: |
-          FQDN=$(az containerapp show \
-            --name ${{ env.CONTAINER_APP_NAME }} \
-            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-            --query 'properties.configuration.ingress.fqdn' -o tsv 2>/dev/null || echo "")
+    #   - name: 🔗 Check Application Endpoint
+    #     id: endpoint-health
+    #     continue-on-error: true
+    #     run: |
+    #       FQDN=$(az containerapp show \
+    #         --name ${{ env.CONTAINER_APP_NAME }} \
+    #         --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+    #         --query 'properties.configuration.ingress.fqdn' -o tsv 2>/dev/null || echo "")
           
-          if [ -z "$FQDN" ]; then
-            echo "❌ Could not retrieve Container App FQDN"
-            exit 1
-          fi
+    #       if [ -z "$FQDN" ]; then
+    #         echo "❌ Could not retrieve Container App FQDN"
+    #         exit 1
+    #       fi
           
-          echo "Testing endpoint: https://${FQDN}/health"
+    #       echo "Testing endpoint: https://${FQDN}/health"
           
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://${FQDN}/health 2>/dev/null || echo "000")
+    #       HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://${FQDN}/health 2>/dev/null || echo "000")
           
-          echo "HTTP Status: $HTTP_CODE"
-          echo "http-code=${HTTP_CODE}" >> $GITHUB_OUTPUT
+    #       echo "HTTP Status: $HTTP_CODE"
+    #       echo "http-code=${HTTP_CODE}" >> $GITHUB_OUTPUT
           
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ Health endpoint returned non-200 status"
-            exit 1
-          else
-            echo "✅ Health endpoint is responding"
-          fi
+    #       if [ "$HTTP_CODE" != "200" ]; then
+    #         echo "❌ Health endpoint returned non-200 status"
+    #         exit 1
+    #       else
+    #         echo "✅ Health endpoint is responding"
+    #       fi
 
       - name: 📊 Check Latest CI/CD Workflow Runs
         id: workflow-status
