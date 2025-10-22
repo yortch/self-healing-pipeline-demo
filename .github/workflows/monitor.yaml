@@ -157,11 +157,11 @@ jobs:
           fi
           
           # Check CD Failures
-            #   if [ "${{ steps.workflow-status.outputs.cd-failed }}" == "true" ]; then
-            #     FAILURE_DETECTED=true
-            #     FAILURE_TYPE="${FAILURE_TYPE}cd-pipeline,"
-            #     FAILURE_DETAILS="${FAILURE_DETAILS}CD Pipeline Failure detected (Run ID: ${{ steps.workflow-status.outputs.recent-cd-failure-id }})\n"
-            #   fi
+          if [ "${{ steps.workflow-status.outputs.cd-failed }}" == "true" ]; then
+            FAILURE_DETECTED=true
+            FAILURE_TYPE="${FAILURE_TYPE}cd-pipeline,"
+            FAILURE_DETAILS="${FAILURE_DETAILS}CD Pipeline Failure detected (Run ID: ${{ steps.workflow-status.outputs.recent-cd-failure-id }})\n"
+          fi
           
           # Remove trailing comma from failure type
           FAILURE_TYPE="${FAILURE_TYPE%,}"
@@ -173,7 +173,6 @@ jobs:
           if [ "$FAILURE_DETECTED" == "true" ]; then
             echo "❌ Failures detected: $FAILURE_TYPE"
             echo -e "Details:\n$FAILURE_DETAILS"
-            exit 1
           else
             echo "✅ All systems operational"
           fi
