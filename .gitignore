@@ -4,6 +4,4 @@ npm-debug.log
 dist/
 build/
 .git/
-.github/
 .vscode/
-*.md

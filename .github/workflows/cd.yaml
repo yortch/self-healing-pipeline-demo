@@ -1,0 +1,206 @@
+name: CD - Deploy to Azure Container Apps
+
+on:
+  workflow_run:
+    workflows: ['CI - Build and Push to ACR']
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      image-uri:
+        description: 'Docker image URI to deploy'
+        required: false
+        type: string
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+  CONTAINER_APP_NAME: ${{ secrets.CONTAINER_APP_NAME }}
+  REGISTRY_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+
+jobs:
+  check-ci-status:
+    runs-on: ubuntu-latest
+    outputs:
+      ci-success: ${{ steps.check-status.outputs.ci-success }}
+    
+    steps:
+      - name: 🔍 Check CI workflow status
+        id: check-status
+        run: |
+          if [ "${{ github.event.workflow_run.conclusion }}" == "success" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "ci-success=true" >> $GITHUB_OUTPUT
+          else
+            echo "ci-success=false" >> $GITHUB_OUTPUT
+          fi
+
+  deploy:
+    needs: check-ci-status
+    runs-on: ubuntu-latest
+    if: needs.check-ci-status.outputs.ci-success == 'true'
+    
+    steps:
+      - name: ✅ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Azure login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: 📝 Get image URI from previous CI run
+        id: get-image-uri
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          # Get the image URI from the CI workflow artifacts or GitHub API
+          IMAGE_URI="${{ secrets.ACR_LOGIN_SERVER }}/self-healing-pipeline:${{ github.event.workflow_run.head_commit.id }}"
+          echo "image-uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+
+      - name: 📝 Use provided image URI
+        id: use-provided-uri
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ -z "${{ github.event.inputs.image-uri }}" ]; then
+            echo "image-uri=${{ secrets.ACR_LOGIN_SERVER }}/self-healing-pipeline:latest" >> $GITHUB_OUTPUT
+          else
+            echo "image-uri=${{ github.event.inputs.image-uri }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🔐 Log in to Azure Container Registry
+        run: |
+          az acr login --name $(echo ${{ env.REGISTRY_LOGIN_SERVER }} | cut -d. -f1)
+
+      - name: 🚀 Update Container App with new image
+        run: |
+          IMAGE_URI=${{ steps.get-image-uri.outputs.image-uri || steps.use-provided-uri.outputs.image-uri }}
+          
+          echo "Deploying image: $IMAGE_URI"
+          
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --image $IMAGE_URI
+
+      - name: ⏳ Wait for deployment to stabilize
+        run: |
+          echo "Waiting for Container App to stabilize..."
+          
+          # Wait for 30 seconds to allow the deployment to initialize
+          sleep 30
+          
+          # Check the status multiple times
+          for i in {1..5}; do
+            STATUS=$(az containerapp show \
+              --name ${{ env.CONTAINER_APP_NAME }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --query 'properties.runningStatus' -o tsv)
+            
+            echo "Deployment status attempt $i: $STATUS"
+            
+            if [ "$STATUS" == "Running" ]; then
+              echo "✅ Container App is running"
+              break
+            fi
+            
+            if [ $i -lt 5 ]; then
+              sleep 10
+            fi
+          done
+
+      - name: 🏥 Get Container App details
+        id: container-app-info
+        run: |
+          FQDN=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query 'properties.configuration.ingress.fqdn' -o tsv)
+          
+          STATUS=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query 'properties.runningStatus' -o tsv)
+          
+          echo "fqdn=${FQDN}" >> $GITHUB_OUTPUT
+          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+
+      - name: 🔗 Perform health checks
+        id: health-check
+        continue-on-error: true
+        run: |
+          FQDN=${{ steps.container-app-info.outputs.fqdn }}
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          
+          echo "Performing health checks on https://${FQDN}/health"
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://${FQDN}/health)
+            
+            echo "Health check attempt $((RETRY_COUNT + 1)): HTTP $HTTP_CODE"
+            
+            if [ "$HTTP_CODE" == "200" ]; then
+              echo "✅ Health check passed"
+              echo "health-status=healthy" >> $GITHUB_OUTPUT
+              break
+            fi
+            
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "Waiting before next attempt..."
+              sleep 10
+            fi
+          done
+          
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "⚠️ Health check failed after $MAX_RETRIES attempts"
+            echo "health-status=unhealthy" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: 🧪 Test application endpoints
+        continue-on-error: true
+        run: |
+          FQDN=${{ steps.container-app-info.outputs.fqdn }}
+          
+          echo "Testing root endpoint..."
+          curl -s https://${FQDN}/ | jq . || echo "Root endpoint test failed"
+          
+          echo ""
+          echo "Testing status endpoint..."
+          curl -s https://${FQDN}/status | jq . || echo "Status endpoint test failed"
+
+      - name: 📊 Display deployment summary
+        run: |
+          echo "## 🎉 CD Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Container App | ${{ env.CONTAINER_APP_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource Group | ${{ env.AZURE_RESOURCE_GROUP }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ steps.container-app-info.outputs.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| FQDN | https://${{ steps.container-app-info.outputs.fqdn }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Health Status | ${{ steps.health-check.outputs.health-status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployed At | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |" >> $GITHUB_STEP_SUMMARY
+
+  notify-success:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: ✅ Deployment Succeeded
+        run: |
+          echo "🎉 CD Pipeline completed successfully!"
+          echo "Application is deployed and running"
+
+  notify-failure:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - name: ❌ Deployment Failed
+        run: |
+          echo "❌ CD Pipeline failed!"
+          exit 1

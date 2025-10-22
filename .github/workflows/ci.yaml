@@ -1,0 +1,154 @@
+name: CI - Build and Push to ACR
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+      - '.github/workflows/ci.yaml'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+  workflow_dispatch:
+
+env:
+  REGISTRY_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  REGISTRY_USERNAME: ${{ secrets.ACR_USERNAME }}
+  REGISTRY_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+  IMAGE_NAME: self-healing-pipeline
+  IMAGE_TAG: ${{ github.sha }}
+  IMAGE_TAG_LATEST: latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    outputs:
+      image-digest: ${{ steps.docker-push.outputs.digest }}
+      image-uri: ${{ steps.docker-push.outputs.image-uri }}
+    
+    steps:
+      - name: ✅ Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 📋 Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      - name: 🧪 Run tests
+        run: npm test
+
+      - name: 🔍 Run linting
+        continue-on-error: true
+        run: npm run lint
+
+      - name: 🔐 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔑 Log in to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY_LOGIN_SERVER }}
+          username: ${{ env.REGISTRY_USERNAME }}
+          password: ${{ env.REGISTRY_PASSWORD }}
+
+      - name: 🏗️ Build Docker image
+        uses: docker/build-push-action@v5
+        id: docker-build
+        with:
+          context: .
+          push: false
+          tags: |
+            ${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG_LATEST }}
+          outputs: type=docker,dest=/tmp/image.tar
+          cache-from: type=registry,ref=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: 📤 Upload Docker image to runner
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/image.tar
+          retention-days: 1
+
+      - name: 🛡️ Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          input: '/tmp/image.tar'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: 📤 Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy'
+
+      - name: 🐳 Build and push Docker image to ACR
+        id: docker-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG_LATEST }}
+          cache-from: type=registry,ref=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: 📝 Generate image metadata
+        id: image-metadata
+        run: |
+          echo "image-uri=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+          echo "image-digest=${{ steps.docker-push.outputs.digest }}" >> $GITHUB_OUTPUT
+          echo "pushed-at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: 📊 Display build summary
+        run: |
+          echo "## 🎉 CI Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image URI | \`${{ steps.image-metadata.outputs.image-uri }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Digest | \`${{ steps.image-metadata.outputs.image-digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pushed At | ${{ steps.image-metadata.outputs.pushed-at }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  notify-success:
+    needs: build
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: ✅ CI Pipeline Succeeded
+        run: |
+          echo "🎉 CI Pipeline completed successfully!"
+          echo "Image URI: ${{ needs.build.outputs.image-uri }}"
+          echo "Image ready for deployment via CD pipeline"
+
+  notify-failure:
+    needs: build
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - name: ❌ CI Pipeline Failed
+        run: |
+          echo "❌ CI Pipeline failed!"
+          exit 1

@@ -1,0 +1,253 @@
+name: Monitor - Detect Failures and Trigger Healing
+
+on:
+  schedule:
+    # Run every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+  CONTAINER_APP_NAME: ${{ secrets.CONTAINER_APP_NAME }}
+
+jobs:
+  monitor-pipeline:
+    runs-on: ubuntu-latest
+    
+    outputs:
+      failure-detected: ${{ steps.check-failures.outputs.failure-detected }}
+      failure-type: ${{ steps.check-failures.outputs.failure-type }}
+      failure-details: ${{ steps.check-failures.outputs.failure-details }}
+    
+    steps:
+      - name: ✅ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Azure login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: 🏥 Check Container App Health
+        id: container-app-health
+        continue-on-error: true
+        run: |
+          echo "Checking Container App status..."
+          
+          STATUS=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query 'properties.runningStatus' -o tsv 2>/dev/null || echo "UNKNOWN")
+          
+          echo "Container App Status: $STATUS"
+          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+          
+          if [ "$STATUS" != "Running" ]; then
+            echo "❌ Container App is not running"
+            exit 1
+          else
+            echo "✅ Container App is running"
+          fi
+
+      - name: 🔗 Check Application Endpoint
+        id: endpoint-health
+        continue-on-error: true
+        run: |
+          FQDN=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query 'properties.configuration.ingress.fqdn' -o tsv 2>/dev/null || echo "")
+          
+          if [ -z "$FQDN" ]; then
+            echo "❌ Could not retrieve Container App FQDN"
+            exit 1
+          fi
+          
+          echo "Testing endpoint: https://${FQDN}/health"
+          
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://${FQDN}/health 2>/dev/null || echo "000")
+          
+          echo "HTTP Status: $HTTP_CODE"
+          echo "http-code=${HTTP_CODE}" >> $GITHUB_OUTPUT
+          
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Health endpoint returned non-200 status"
+            exit 1
+          else
+            echo "✅ Health endpoint is responding"
+          fi
+
+      - name: 📊 Check Latest CI/CD Workflow Runs
+        id: workflow-status
+        continue-on-error: true
+        run: |
+          echo "Checking recent CI workflow runs..."
+          
+          # Get last 5 CI workflow runs
+          CI_RUNS=$(gh run list \
+            --workflow ci.yaml \
+            --limit 5 \
+            --json conclusion,status,createdAt,databaseId \
+            --repo ${{ github.repository }})
+          
+          echo "CI Workflow Runs:"
+          echo "$CI_RUNS" | jq .
+          
+          # Check if any recent run failed
+          RECENT_FAILURE=$(echo "$CI_RUNS" | jq '.[] | select(.createdAt > (now - 3600 | todate)) | select(.conclusion == "failure") | .databaseId' | head -1)
+          
+          if [ -n "$RECENT_FAILURE" ]; then
+            echo "ci-failed=true" >> $GITHUB_OUTPUT
+            echo "recent-failure-id=${RECENT_FAILURE}" >> $GITHUB_OUTPUT
+          else
+            echo "ci-failed=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "Checking recent CD workflow runs..."
+          
+          # Get last 5 CD workflow runs
+          CD_RUNS=$(gh run list \
+            --workflow cd.yaml \
+            --limit 5 \
+            --json conclusion,status,createdAt,databaseId \
+            --repo ${{ github.repository }})
+          
+          echo "CD Workflow Runs:"
+          echo "$CD_RUNS" | jq .
+          
+          # Check if any recent run failed
+          RECENT_CD_FAILURE=$(echo "$CD_RUNS" | jq '.[] | select(.createdAt > (now - 3600 | todate)) | select(.conclusion == "failure") | .databaseId' | head -1)
+          
+          if [ -n "$RECENT_CD_FAILURE" ]; then
+            echo "cd-failed=true" >> $GITHUB_OUTPUT
+            echo "recent-cd-failure-id=${RECENT_CD_FAILURE}" >> $GITHUB_OUTPUT
+          else
+            echo "cd-failed=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: 🔍 Analyze Failures
+        id: check-failures
+        run: |
+          FAILURE_DETECTED=false
+          FAILURE_TYPE=""
+          FAILURE_DETAILS=""
+          
+          # Check Container App Health
+          if [ "${{ steps.container-app-health.outcome }}" == "failure" ]; then
+            FAILURE_DETECTED=true
+            FAILURE_TYPE="${FAILURE_TYPE}container-app-status,"
+            FAILURE_DETAILS="${FAILURE_DETAILS}Container App Status: ${{ steps.container-app-health.outputs.status }}\n"
+          fi
+          
+          # Check Endpoint Health
+          if [ "${{ steps.endpoint-health.outcome }}" == "failure" ]; then
+            FAILURE_DETECTED=true
+            FAILURE_TYPE="${FAILURE_TYPE}endpoint-health,"
+            FAILURE_DETAILS="${FAILURE_DETAILS}Endpoint Health Check HTTP: ${{ steps.endpoint-health.outputs.http-code }}\n"
+          fi
+          
+          # Check CI Failures
+          if [ "${{ steps.workflow-status.outputs.ci-failed }}" == "true" ]; then
+            FAILURE_DETECTED=true
+            FAILURE_TYPE="${FAILURE_TYPE}ci-pipeline,"
+            FAILURE_DETAILS="${FAILURE_DETAILS}CI Pipeline Failure detected (Run ID: ${{ steps.workflow-status.outputs.recent-failure-id }})\n"
+          fi
+          
+          # Check CD Failures
+          if [ "${{ steps.workflow-status.outputs.cd-failed }}" == "true" ]; then
+            FAILURE_DETECTED=true
+            FAILURE_TYPE="${FAILURE_TYPE}cd-pipeline,"
+            FAILURE_DETAILS="${FAILURE_DETAILS}CD Pipeline Failure detected (Run ID: ${{ steps.workflow-status.outputs.recent-cd-failure-id }})\n"
+          fi
+          
+          # Remove trailing comma from failure type
+          FAILURE_TYPE="${FAILURE_TYPE%,}"
+          
+          echo "failure-detected=${FAILURE_DETECTED}" >> $GITHUB_OUTPUT
+          echo "failure-type=${FAILURE_TYPE}" >> $GITHUB_OUTPUT
+          echo "failure-details=${FAILURE_DETAILS}" >> $GITHUB_OUTPUT
+          
+          if [ "$FAILURE_DETECTED" == "true" ]; then
+            echo "❌ Failures detected: $FAILURE_TYPE"
+            echo -e "Details:\n$FAILURE_DETAILS"
+            exit 1
+          else
+            echo "✅ All systems operational"
+          fi
+
+      - name: 📊 Display monitoring summary
+        if: always()
+        run: |
+          echo "## 📊 Monitoring Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Container App Health | ${{ steps.container-app-health.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Endpoint Health | ${{ steps.endpoint-health.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| CI Pipeline | $([ '${{ steps.workflow-status.outputs.ci-failed }}' == 'true' ] && echo '❌ Failed' || echo '✅ Passing') |" >> $GITHUB_STEP_SUMMARY
+          echo "| CD Pipeline | $([ '${{ steps.workflow-status.outputs.cd-failed }}' == 'true' ] && echo '❌ Failed' || echo '✅ Passing') |" >> $GITHUB_STEP_SUMMARY
+          echo "| Overall Status | $([ '${{ steps.check-failures.outcome }}' == 'success' ] && echo '✅ Healthy' || echo '⚠️ Issues Detected') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Checked at:** $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_STEP_SUMMARY
+
+  trigger-healing:
+    needs: monitor-pipeline
+    runs-on: ubuntu-latest
+    if: needs.monitor-pipeline.outputs.failure-detected == 'true'
+    
+    steps:
+      - name: ✅ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔍 Analyze failure logs
+        id: analyze-failure
+        run: |
+          FAILURE_TYPES="${{ needs.monitor-pipeline.outputs.failure-type }}"
+          FAILURE_DETAILS="${{ needs.monitor-pipeline.outputs.failure-details }}"
+          
+          echo "Analyzing failures: $FAILURE_TYPES"
+          echo -e "$FAILURE_DETAILS"
+          
+          # Determine which workflow failed
+          if [[ "$FAILURE_TYPES" == *"ci-pipeline"* ]]; then
+            echo "failure-category=build" >> $GITHUB_OUTPUT
+            echo "workflow-failed=CI Pipeline" >> $GITHUB_OUTPUT
+          elif [[ "$FAILURE_TYPES" == *"cd-pipeline"* ]]; then
+            echo "failure-category=deployment" >> $GITHUB_OUTPUT
+            echo "workflow-failed=CD Pipeline" >> $GITHUB_OUTPUT
+          elif [[ "$FAILURE_TYPES" == *"endpoint-health"* ]]; then
+            echo "failure-category=runtime" >> $GITHUB_OUTPUT
+            echo "workflow-failed=Application Health" >> $GITHUB_OUTPUT
+          elif [[ "$FAILURE_TYPES" == *"container-app-status"* ]]; then
+            echo "failure-category=infrastructure" >> $GITHUB_OUTPUT
+            echo "workflow-failed=Container App Status" >> $GITHUB_OUTPUT
+          else
+            echo "failure-category=unknown" >> $GITHUB_OUTPUT
+            echo "workflow-failed=Unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🎯 Trigger healing workflow
+        run: |
+          echo "Triggering healing workflow..."
+          
+          # Dispatch the heal workflow
+          gh workflow run heal.yaml \
+            --ref ${{ github.ref }} \
+            -f failure-type='${{ needs.monitor-pipeline.outputs.failure-type }}' \
+            -f failure-category='${{ steps.analyze-failure.outputs.failure-category }}'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: 📊 Display healing summary
+        run: |
+          echo "## 🔧 Healing Triggered" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Detected Failures:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Type:** ${{ needs.monitor-pipeline.outputs.failure-type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Category:** ${{ steps.analyze-failure.outputs.failure-category }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Workflow:** ${{ steps.analyze-failure.outputs.workflow-failed }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Action Taken:** Healing workflow triggered to create GitHub Issue and assign to Copilot" >> $GITHUB_STEP_SUMMARY
