@@ -1,0 +1,7 @@
+{
+  "name": "self-healing-pipeline-demo",
+  "description": "Self-Healing CI/CD Pipeline Demo with GitHub Actions and Azure Container Apps",
+  "metadata": {
+    "template": "@azure/bicep-demo"
+  }
+}

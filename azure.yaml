@@ -1,0 +1,22 @@
+name: self-healing-pipeline-demo
+metadata:
+  template: self-healing-pipeline-demo@0.1.0
+  description: Self-Healing CI/CD Pipeline Demo with GitHub Actions and Azure Container Apps
+
+infra:
+  provider: bicep
+  path: infra
+
+services:
+  app:
+    project: .
+    language: js
+    host: containerapp
+    docker:
+      path: ./Dockerfile
+      context: .
+
+hooks:
+  preup:
+    shell: pwsh
+    run: echo "Preparing resources for self-healing pipeline demo..."
