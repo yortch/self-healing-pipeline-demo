@@ -153,7 +153,7 @@ jobs:
             const failureDetails = `
             ### Copilot Healing Request
             
-            @github-copilot, please help remediate this failure:
+            @copilot, please help remediate this failure:
             
             **Failure Type:** ${{ github.event.inputs.failure-type }}
             **Category:** ${{ github.event.inputs.failure-category }}

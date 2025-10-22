@@ -1,9 +1,9 @@
 name: Monitor - Detect Failures and Trigger Healing
 
 on:
-  schedule:
-    # Run every 15 minutes
-    - cron: '*/15 * * * *'
+  # schedule:
+  #   # Run every 15 minutes
+  #   - cron: '*/15 * * * *'
   workflow_dispatch:
 
 env:
