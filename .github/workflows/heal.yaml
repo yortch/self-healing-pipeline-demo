@@ -151,42 +151,80 @@ jobs:
             
             return issue.data.number;
 
-      - name: 🤖 Assign issue to Copilot Coding Agent (GraphQL)
+      - name: 🤖 Assign issue to Copilot Coding Agent
         uses: actions/github-script@v7
         with:
           script: |
+            const issueNumber = ${{ steps.create-issue.outputs.number }};
             const issueNodeId = '${{ steps.create-issue.outputs.node-id }}';
             
-            // GraphQL mutation to create a Copilot conversation from the issue
-            const mutation = `
-              mutation($input: CreateCopilotConversationFromIssueInput!) {
-                createCopilotConversationFromIssue(input: $input) {
-                  copilotConversation {
-                    id
+            try {
+              // Step 1: Get Copilot bot ID from repository's suggested actors
+              const suggestedActorsQuery = `
+                query($owner: String!, $name: String!) {
+                  repository(owner: $owner, name: $name) {
+                    suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
+                      nodes {
+                        login
+                        __typename
+                        ... on Bot {
+                          id
+                        }
+                      }
+                    }
                   }
                 }
+              `;
+              
+              const actorsResult = await github.graphql(suggestedActorsQuery, {
+                owner: context.repo.owner,
+                name: context.repo.repo
+              });
+              
+              const copilotBot = actorsResult.repository.suggestedActors.nodes.find(
+                node => node.login === 'copilot-swe-agent'
+              );
+              
+              if (!copilotBot) {
+                throw new Error('Copilot Coding Agent not available in this repository. Ensure you have a GitHub Copilot subscription.');
               }
-            `;
-            
-            const variables = {
-              input: {
+              
+              console.log(`✅ Found Copilot bot with ID: ${copilotBot.id}`);
+              
+              // Step 2: Assign the issue to Copilot using GraphQL mutation
+              const assignMutation = `
+                mutation($issueId: ID!, $botId: ID!) {
+                  replaceActorsForAssignable(input: {assignableId: $issueId, actorIds: [$botId]}) {
+                    assignable {
+                      ... on Issue {
+                        id
+                        title
+                        assignees(first: 10) {
+                          nodes {
+                            login
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+              
+              const assignResult = await github.graphql(assignMutation, {
                 issueId: issueNodeId,
-                agentSlug: "coding-agent",
-                repositoryId: context.payload.repository.node_id
-              }
-            };
-            
-            try {
-              const result = await github.graphql(mutation, variables);
-              console.log('✅ Successfully assigned issue to Copilot Coding Agent');
-              console.log('Copilot Conversation ID:', result.createCopilotConversationFromIssue.copilotConversation.id);
+                botId: copilotBot.id
+              });
+              
+              console.log(`✅ Issue #${issueNumber} successfully assigned to Copilot Coding Agent`);
+              console.log('Copilot will analyze the issue and create a PR automatically.');
+              
             } catch (error) {
-              console.error('❌ Failed to assign to Copilot Coding Agent:', error);
-              console.log('Issue created but manual assignment may be needed.');
-              // Don't fail the workflow - the issue is still created
+              console.error('❌ Failed to assign to Copilot:', error);
+              console.error('Make sure you have GitHub Copilot Pro/Business/Enterprise subscription');
+              throw error;
             }
 
-      - name: 👤 Add assignment comment for Copilot
+      - name: 👤 Add context comment for analysis
         uses: actions/github-script@v7
         with:
           script: |
