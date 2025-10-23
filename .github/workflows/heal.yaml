@@ -18,6 +18,10 @@ on:
           - infrastructure
           - unknown
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   create-healing-issue:
     runs-on: ubuntu-latest
@@ -25,6 +29,7 @@ jobs:
     outputs:
       issue-number: ${{ steps.create-issue.outputs.number }}
       issue-url: ${{ steps.create-issue.outputs.url }}
+      issue-node-id: ${{ steps.create-issue.outputs.node-id }}
     
     steps:
       - name: ✅ Checkout code
@@ -114,12 +119,11 @@ jobs:
             \`\`\`
             
             ### Required Actions
-            #github-pull-request_copilot-coding-agent
             
             Please:
             1. Analyze the failure logs above
             2. Identify the root cause
-            3. Create a fix
+            3. Create a fix on a new branch
             4. Open a pull request with the remediation
             
             ### Monitoring Context
@@ -140,32 +144,68 @@ jobs:
             
             core.setOutput('number', issue.data.number);
             core.setOutput('url', issue.data.html_url);
+            core.setOutput('node-id', issue.data.node_id);
             
             console.log(`✅ Issue #${issue.data.number} created: ${issue.data.html_url}`);
+            console.log(`Node ID: ${issue.data.node_id}`);
             
             return issue.data.number;
+
+      - name: 🤖 Assign issue to Copilot Coding Agent (GraphQL)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNodeId = '${{ steps.create-issue.outputs.node-id }}';
+            
+            // GraphQL mutation to create a Copilot conversation from the issue
+            const mutation = `
+              mutation($input: CreateCopilotConversationFromIssueInput!) {
+                createCopilotConversationFromIssue(input: $input) {
+                  copilotConversation {
+                    id
+                  }
+                }
+              }
+            `;
+            
+            const variables = {
+              input: {
+                issueId: issueNodeId,
+                agentSlug: "coding-agent",
+                repositoryId: context.payload.repository.node_id
+              }
+            };
+            
+            try {
+              const result = await github.graphql(mutation, variables);
+              console.log('✅ Successfully assigned issue to Copilot Coding Agent');
+              console.log('Copilot Conversation ID:', result.createCopilotConversationFromIssue.copilotConversation.id);
+            } catch (error) {
+              console.error('❌ Failed to assign to Copilot Coding Agent:', error);
+              console.log('Issue created but manual assignment may be needed.');
+              // Don't fail the workflow - the issue is still created
+            }
 
       - name: 👤 Add assignment comment for Copilot
         uses: actions/github-script@v7
         with:
           script: |
             const issueNumber = ${{ steps.create-issue.outputs.number }};
-            const failureDetails = `
-            ### Copilot Healing Request
+            const failureDetails = `### 🤖 Copilot Coding Agent Assignment
             
-            @copilot, please help remediate this failure:
+            This issue has been assigned to GitHub Copilot Coding Agent for automated remediation.
             
-            **Failure Type:** ${{ github.event.inputs.failure-type }}
+            **Failure Type:** ${{ github.event.inputs.failure-type }}  
             **Category:** ${{ github.event.inputs.failure-category }}
             
-            Please:
-            1. Analyze the failure logs and error messages
-            2. Identify the root cause
+            **Expected Actions:**
+            1. Analyze the failure logs and error messages above
+            2. Identify the root cause of the failure
             3. Create a fix on a new branch
-            4. Open a pull request with your changes
-            5. Reference this issue in your PR description
+            4. Open a pull request with the remediation
+            5. Reference this issue in the PR description
             
-            Include the hashtag \`#github-pull-request_copilot-coding-agent\` in the PR to trigger automatic processing.
+            The Copilot Coding Agent will automatically process this request and create a pull request with the fix.
             `;
             
             await github.rest.issues.createComment({
@@ -177,22 +217,6 @@ jobs:
             
             console.log(`✅ Copilot assignment comment added to issue #${issueNumber}`);
 
-      - name: 🏷️ Assign issue to Copilot (via automation)
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const issueNumber = ${{ steps.create-issue.outputs.number }};
-            
-            // Add a label indicating this needs Copilot attention
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issueNumber,
-              labels: ['needs-copilot-review']
-            });
-            
-            console.log(`✅ Labels updated for issue #${issueNumber}`);
-
       - name: 📊 Display issue creation summary
         run: |
           echo "## 🎯 Healing Issue Created" >> $GITHUB_STEP_SUMMARY
@@ -203,7 +227,7 @@ jobs:
           echo "| Issue URL | ${{ steps.create-issue.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Failure Type | ${{ github.event.inputs.failure-type }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Failure Category | ${{ github.event.inputs.failure-category }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Status | ✅ Assigned to Copilot |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ✅ Assigned to Copilot Coding Agent |" >> $GITHUB_STEP_SUMMARY
           echo "| Created At | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |" >> $GITHUB_STEP_SUMMARY
 
   notify-team:
@@ -218,4 +242,4 @@ jobs:
           echo "📋 Issue #${{ needs.create-healing-issue.outputs.issue-number }} created"
           echo "🔗 ${{ needs.create-healing-issue.outputs.issue-url }}"
           echo ""
-          echo "The Copilot Coding Agent will analyze the issue and create a fix."
+          echo "The Copilot Coding Agent has been assigned and will analyze the issue to create a fix."
