@@ -66,12 +66,12 @@ This project showcases an intelligent pipeline that:
 ### Required Accounts
 - **GitHub Account** - Repository and Actions
 - **Azure Subscription** - Container Apps, Container Registry
-- **GitHub Copilot** - For automated issue remediation
+- **GitHub Copilot Pro/Business/Enterprise** - For automated issue remediation ⚠️ **[Setup Required](COPILOT_SETUP.md)**
 
 ### Required Permissions
 - GitHub repository admin access
 - Azure subscription contributor role
-- GitHub token with repo and workflow permissions
+- GitHub Personal Access Token for Copilot assignment (see [COPILOT_SETUP.md](COPILOT_SETUP.md))
 
 ## 🚀 Quick Start
 
@@ -115,11 +115,14 @@ This will:
 
 ### 3. Configure GitHub Secrets
 
+⚠️ **Important:** Before configuring these secrets, complete the [Copilot Setup Guide](COPILOT_SETUP.md) to create the required Personal Access Token.
+
 Add the following secrets to your GitHub repository:
 
 **Repository Settings > Secrets and variables > Actions**
 
 ```
+COPILOT_TOKEN              # Personal Access Token for Copilot assignment (REQUIRED - see COPILOT_SETUP.md)
 AZURE_CREDENTIALS          # Service Principal credentials (JSON format)
 AZURE_SUBSCRIPTION_ID      # Your Azure subscription ID
 AZURE_RESOURCE_GROUP       # Resource group name (e.g., rg-self-healing-pipeline-demo)

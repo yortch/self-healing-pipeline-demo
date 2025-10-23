@@ -156,6 +156,7 @@ jobs:
       - name: 🤖 Assign issue to Copilot Coding Agent
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.COPILOT_TOKEN }}
           script: |
             const issueNumber = ${{ steps.create-issue.outputs.number }};
             const issueNodeId = '${{ steps.create-issue.outputs.node-id }}';
