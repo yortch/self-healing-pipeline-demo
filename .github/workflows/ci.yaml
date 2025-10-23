@@ -45,16 +45,20 @@ jobs:
         with:
           node-version: '18'
           cache: 'npm'
+          cache-dependency-path: 'src/package-lock.json'
 
       - name: 📦 Install dependencies
         run: npm ci
+        working-directory: src
 
       - name: 🧪 Run tests
         run: npm test
+        working-directory: src
 
       - name: 🔍 Run linting
         continue-on-error: true
         run: npm run lint
+        working-directory: src
 
       - name: 🔐 Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
