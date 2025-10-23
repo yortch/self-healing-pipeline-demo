@@ -19,8 +19,10 @@ on:
           - unknown
 
 permissions:
-  contents: read
+  contents: write
   issues: write
+  pull-requests: write
+  actions: write
 
 jobs:
   create-healing-issue:
