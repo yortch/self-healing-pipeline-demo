@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_ENV_NAME: ${{ secrets.AZURE_ENV_NAME || 'prod' }}
+  AZURE_ENV_NAME: ${{ secrets.AZURE_ENV_NAME != '' && secrets.AZURE_ENV_NAME || 'prod' }}
   IMAGE_TAG: ${{ github.sha }}
   IMAGE_TAG_LATEST: latest
 
@@ -78,17 +78,34 @@ jobs:
             exit 0
           fi
           
-          # Get ACR name from resource group
-          ACR_NAME=$(az acr list --resource-group "$RESOURCE_GROUP" --query "[0].name" -o tsv 2>/dev/null || echo "")
+          echo "🔍 Looking for ACR in resource group: $RESOURCE_GROUP"
+          
+          # Get ACR name from resource group with error handling
+          ACR_LIST_OUTPUT=$(az acr list --resource-group "$RESOURCE_GROUP" 2>&1)
+          ACR_LIST_EXIT_CODE=$?
+          
+          if [ $ACR_LIST_EXIT_CODE -ne 0 ]; then
+            echo "⚠️ Failed to list ACRs in resource group: $ACR_LIST_OUTPUT"
+            echo "acr-available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          ACR_NAME=$(echo "$ACR_LIST_OUTPUT" | jq -r '.[0].name // empty')
           
           if [ -z "$ACR_NAME" ]; then
-            echo "⚠️ No ACR found in resource group $RESOURCE_GROUP, skipping ACR operations"
+            echo "⚠️ No ACR found in resource group $RESOURCE_GROUP"
+            echo "💡 Provision infrastructure with: azd provision"
             echo "acr-available=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           
           # Get ACR login server
-          ACR_LOGIN_SERVER=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
+          ACR_LOGIN_SERVER=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv 2>&1)
+          if [ $? -ne 0 ]; then
+            echo "⚠️ Failed to get ACR login server: $ACR_LOGIN_SERVER"
+            echo "acr-available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           
           echo "✅ Found ACR: $ACR_NAME"
           echo "✅ ACR Login Server: $ACR_LOGIN_SERVER"
@@ -103,22 +120,40 @@ jobs:
           # This respects the azure.yaml configuration
           export AZURE_ENV_NAME="${{ env.AZURE_ENV_NAME }}"
           
+          # Extract image name from azure.yaml
+          IMAGE_NAME=$(grep '^name:' azure.yaml | head -1 | awk '{print $2}')
+          if [ -z "$IMAGE_NAME" ]; then
+            echo "❌ Could not extract image name from azure.yaml"
+            exit 1
+          fi
+          echo "📦 Image name from azure.yaml: $IMAGE_NAME"
+          
           # Create azd environment if it doesn't exist
-          azd env new "$AZURE_ENV_NAME" 2>/dev/null || azd env select "$AZURE_ENV_NAME"
+          azd env new "$AZURE_ENV_NAME" 2>&1 | grep -v "already exists" || azd env select "$AZURE_ENV_NAME"
           
           # Package the application (builds Docker image)
+          echo "🏗️ Building Docker image with azd package..."
           azd package --output-path ./package-output
           
-          # Get the image name from azure.yaml service configuration
-          IMAGE_NAME="self-healing-pipeline-demo"
+          # Verify the image was created and capture its actual tag
+          # azd typically tags images as: {project-name}:{environment}-{timestamp}
+          # We'll look for the image that was just built
+          BUILT_IMAGE=$(docker images "$IMAGE_NAME" --format "{{.Repository}}:{{.Tag}}" | head -1)
+          if [ -z "$BUILT_IMAGE" ]; then
+            echo "❌ Could not find built image with name: $IMAGE_NAME"
+            docker images
+            exit 1
+          fi
+          echo "✅ Built image: $BUILT_IMAGE"
           
           echo "image-name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "built-image=$BUILT_IMAGE" >> $GITHUB_OUTPUT
 
       - name: 🛡️ Run Trivy vulnerability scan on local image
         uses: aquasecurity/trivy-action@master
         continue-on-error: true
         with:
-          image-ref: '${{ steps.azd-package.outputs.image-name }}:azd-deploy-${{ env.IMAGE_TAG }}'
+          image-ref: '${{ steps.azd-package.outputs.built-image }}'
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
@@ -137,27 +172,29 @@ jobs:
           ACR_LOGIN_SERVER="${{ steps.get-acr-info.outputs.acr-login-server }}"
           ACR_NAME="${{ steps.get-acr-info.outputs.acr-name }}"
           IMAGE_NAME="${{ steps.azd-package.outputs.image-name }}"
+          BUILT_IMAGE="${{ steps.azd-package.outputs.built-image }}"
           
           # Login to ACR
-          az acr login --name "$ACR_NAME"
+          echo "🔐 Logging in to ACR: $ACR_NAME"
+          if ! az acr login --name "$ACR_NAME"; then
+            echo "❌ Failed to login to ACR. Ensure the service principal has AcrPush role."
+            exit 1
+          fi
           
           # Tag the image built by azd package
-          LOCAL_IMAGE="$IMAGE_NAME:azd-deploy-${{ env.IMAGE_TAG }}"
           REMOTE_IMAGE_SHA="$ACR_LOGIN_SERVER/$IMAGE_NAME:${{ env.IMAGE_TAG }}"
           REMOTE_IMAGE_LATEST="$ACR_LOGIN_SERVER/$IMAGE_NAME:${{ env.IMAGE_TAG_LATEST }}"
           
-          echo "Tagging image: $LOCAL_IMAGE -> $REMOTE_IMAGE_SHA"
-          docker tag "$LOCAL_IMAGE" "$REMOTE_IMAGE_SHA"
-          docker tag "$LOCAL_IMAGE" "$REMOTE_IMAGE_LATEST"
+          echo "🏷️ Tagging image: $BUILT_IMAGE -> $REMOTE_IMAGE_SHA"
+          docker tag "$BUILT_IMAGE" "$REMOTE_IMAGE_SHA"
+          docker tag "$BUILT_IMAGE" "$REMOTE_IMAGE_LATEST"
           
-          echo "Pushing image: $REMOTE_IMAGE_SHA"
+          echo "📤 Pushing image: $REMOTE_IMAGE_SHA"
           docker push "$REMOTE_IMAGE_SHA"
-          docker push "$REMOTE_IMAGE_LATEST"
+          PUSH_DIGEST=$(docker push "$REMOTE_IMAGE_LATEST" 2>&1 | grep 'digest:' | awk '{print $3}')
           
-          # Get image digest
-          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$REMOTE_IMAGE_SHA" | cut -d'@' -f2)
-          
-          echo "image-digest=$IMAGE_DIGEST" >> $GITHUB_OUTPUT
+          echo "✅ Image pushed successfully"
+          echo "image-digest=$PUSH_DIGEST" >> $GITHUB_OUTPUT
 
       - name: 📝 Generate image metadata
         if: steps.get-acr-info.outputs.acr-available == 'true'
