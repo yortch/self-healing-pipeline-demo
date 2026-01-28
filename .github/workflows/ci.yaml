@@ -19,10 +19,7 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
-  REGISTRY_USERNAME: ${{ secrets.ACR_USERNAME }}
-  REGISTRY_PASSWORD: ${{ secrets.ACR_PASSWORD }}
-  IMAGE_NAME: self-healing-pipeline
+  AZURE_ENV_NAME: ${{ secrets.AZURE_ENV_NAME || 'prod' }}
   IMAGE_TAG: ${{ github.sha }}
   IMAGE_TAG_LATEST: latest
 
@@ -31,8 +28,8 @@ jobs:
     runs-on: ubuntu-latest
     
     outputs:
-      image-digest: ${{ steps.image-metadata.outputs.image-digest }}
       image-uri: ${{ steps.image-metadata.outputs.image-uri }}
+      acr-login-server: ${{ steps.get-acr-info.outputs.acr-login-server }}
     
     steps:
       - name: ✅ Checkout code
@@ -60,40 +57,68 @@ jobs:
         run: npm run lint
         working-directory: src
 
-      - name: 🔐 Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: 🔧 Install Azure Developer CLI
+        run: |
+          curl -fsSL https://aka.ms/install-azd.sh | bash
 
-      - name: 🔑 Log in to Azure Container Registry
-        if: env.REGISTRY_USERNAME != ''
-        uses: azure/docker-login@v1
+      - name: 🔐 Azure login
+        uses: azure/login@v1
         with:
-          login-server: ${{ env.REGISTRY_LOGIN_SERVER }}
-          username: ${{ env.REGISTRY_USERNAME }}
-          password: ${{ env.REGISTRY_PASSWORD }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: 🏗️ Build Docker image
-        uses: docker/build-push-action@v5
-        id: docker-build
-        with:
-          context: .
-          push: false
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG_LATEST }}
-          outputs: type=docker,dest=/tmp/image.tar
+      - name: 🔍 Get ACR information from Azure
+        id: get-acr-info
+        run: |
+          # Get ACR name from Azure resources in the resource group
+          RESOURCE_GROUP="${{ secrets.AZURE_RESOURCE_GROUP }}"
+          
+          if [ -z "$RESOURCE_GROUP" ]; then
+            echo "⚠️ AZURE_RESOURCE_GROUP not configured, skipping ACR operations"
+            echo "acr-available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Get ACR name from resource group
+          ACR_NAME=$(az acr list --resource-group "$RESOURCE_GROUP" --query "[0].name" -o tsv 2>/dev/null || echo "")
+          
+          if [ -z "$ACR_NAME" ]; then
+            echo "⚠️ No ACR found in resource group $RESOURCE_GROUP, skipping ACR operations"
+            echo "acr-available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Get ACR login server
+          ACR_LOGIN_SERVER=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
+          
+          echo "✅ Found ACR: $ACR_NAME"
+          echo "✅ ACR Login Server: $ACR_LOGIN_SERVER"
+          echo "acr-available=true" >> $GITHUB_OUTPUT
+          echo "acr-name=$ACR_NAME" >> $GITHUB_OUTPUT
+          echo "acr-login-server=$ACR_LOGIN_SERVER" >> $GITHUB_OUTPUT
 
-      - name: 📤 Upload Docker image to runner
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image
-          path: /tmp/image.tar
-          retention-days: 1
+      - name: 🏗️ Build Docker image with azd package
+        id: azd-package
+        run: |
+          # Use azd package to build the Docker image
+          # This respects the azure.yaml configuration
+          export AZURE_ENV_NAME="${{ env.AZURE_ENV_NAME }}"
+          
+          # Create azd environment if it doesn't exist
+          azd env new "$AZURE_ENV_NAME" 2>/dev/null || azd env select "$AZURE_ENV_NAME"
+          
+          # Package the application (builds Docker image)
+          azd package --output-path ./package-output
+          
+          # Get the image name from azure.yaml service configuration
+          IMAGE_NAME="self-healing-pipeline-demo"
+          
+          echo "image-name=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
-      - name: 🛡️ Run Trivy vulnerability scan
+      - name: 🛡️ Run Trivy vulnerability scan on local image
         uses: aquasecurity/trivy-action@master
         continue-on-error: true
         with:
-          input: '/tmp/image.tar'
+          image-ref: '${{ steps.azd-package.outputs.image-name }}:azd-deploy-${{ env.IMAGE_TAG }}'
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
@@ -105,36 +130,58 @@ jobs:
           sarif_file: 'trivy-results.sarif'
           category: 'trivy'
 
-      - name: 🐳 Build and push Docker image to ACR
-        if: env.REGISTRY_USERNAME != ''
+      - name: 🐳 Tag and push Docker image to ACR
+        if: steps.get-acr-info.outputs.acr-available == 'true'
         id: docker-push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            ${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG_LATEST }}
-          cache-from: type=registry,ref=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+        run: |
+          ACR_LOGIN_SERVER="${{ steps.get-acr-info.outputs.acr-login-server }}"
+          ACR_NAME="${{ steps.get-acr-info.outputs.acr-name }}"
+          IMAGE_NAME="${{ steps.azd-package.outputs.image-name }}"
+          
+          # Login to ACR
+          az acr login --name "$ACR_NAME"
+          
+          # Tag the image built by azd package
+          LOCAL_IMAGE="$IMAGE_NAME:azd-deploy-${{ env.IMAGE_TAG }}"
+          REMOTE_IMAGE_SHA="$ACR_LOGIN_SERVER/$IMAGE_NAME:${{ env.IMAGE_TAG }}"
+          REMOTE_IMAGE_LATEST="$ACR_LOGIN_SERVER/$IMAGE_NAME:${{ env.IMAGE_TAG_LATEST }}"
+          
+          echo "Tagging image: $LOCAL_IMAGE -> $REMOTE_IMAGE_SHA"
+          docker tag "$LOCAL_IMAGE" "$REMOTE_IMAGE_SHA"
+          docker tag "$LOCAL_IMAGE" "$REMOTE_IMAGE_LATEST"
+          
+          echo "Pushing image: $REMOTE_IMAGE_SHA"
+          docker push "$REMOTE_IMAGE_SHA"
+          docker push "$REMOTE_IMAGE_LATEST"
+          
+          # Get image digest
+          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$REMOTE_IMAGE_SHA" | cut -d'@' -f2)
+          
+          echo "image-digest=$IMAGE_DIGEST" >> $GITHUB_OUTPUT
 
       - name: 📝 Generate image metadata
-        if: env.REGISTRY_USERNAME != ''
+        if: steps.get-acr-info.outputs.acr-available == 'true'
         id: image-metadata
         run: |
-          echo "image-uri=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
-          echo "image-digest=${{ steps.docker-push.outputs.digest }}" >> $GITHUB_OUTPUT
+          ACR_LOGIN_SERVER="${{ steps.get-acr-info.outputs.acr-login-server }}"
+          IMAGE_NAME="${{ steps.azd-package.outputs.image-name }}"
+          IMAGE_URI="$ACR_LOGIN_SERVER/$IMAGE_NAME:${{ env.IMAGE_TAG }}"
+          
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "image-digest=${{ steps.docker-push.outputs.image-digest }}" >> $GITHUB_OUTPUT
           echo "pushed-at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
 
       - name: 📊 Display build summary
-        if: env.REGISTRY_USERNAME != ''
+        if: steps.get-acr-info.outputs.acr-available == 'true'
         run: |
           echo "## 🎉 CI Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Name | \`${{ steps.azd-package.outputs.image-name }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Image URI | \`${{ steps.image-metadata.outputs.image-uri }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Image Digest | \`${{ steps.image-metadata.outputs.image-digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ACR Server | \`${{ steps.get-acr-info.outputs.acr-login-server }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Pushed At | ${{ steps.image-metadata.outputs.pushed-at }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
 
@@ -148,9 +195,11 @@ jobs:
           echo "🎉 CI Pipeline completed successfully!"
           if [ -n "${{ needs.build.outputs.image-uri }}" ]; then
             echo "Image URI: ${{ needs.build.outputs.image-uri }}"
+            echo "ACR Server: ${{ needs.build.outputs.acr-login-server }}"
             echo "Image ready for deployment via CD pipeline"
           else
-            echo "Docker image built and tested locally (ACR push skipped - no credentials configured)"
+            echo "Docker image built and tested locally using azd package"
+            echo "ACR push skipped - Azure resources not configured"
           fi
 
   notify-failure:
