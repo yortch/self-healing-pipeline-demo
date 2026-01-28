@@ -31,8 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     
     outputs:
-      image-digest: ${{ steps.docker-push.outputs.digest }}
-      image-uri: ${{ steps.docker-push.outputs.image-uri }}
+      image-digest: ${{ steps.image-metadata.outputs.image-digest }}
+      image-uri: ${{ steps.image-metadata.outputs.image-uri }}
     
     steps:
       - name: ✅ Checkout code
@@ -146,8 +146,12 @@ jobs:
       - name: ✅ CI Pipeline Succeeded
         run: |
           echo "🎉 CI Pipeline completed successfully!"
-          echo "Image URI: ${{ needs.build.outputs.image-uri }}"
-          echo "Image ready for deployment via CD pipeline"
+          if [ -n "${{ needs.build.outputs.image-uri }}" ]; then
+            echo "Image URI: ${{ needs.build.outputs.image-uri }}"
+            echo "Image ready for deployment via CD pipeline"
+          else
+            echo "Docker image built and tested locally (ACR push skipped - no credentials configured)"
+          fi
 
   notify-failure:
     needs: build
