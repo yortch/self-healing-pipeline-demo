@@ -64,6 +64,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: 🔑 Log in to Azure Container Registry
+        if: env.REGISTRY_USERNAME != ''
         uses: azure/docker-login@v1
         with:
           login-server: ${{ env.REGISTRY_LOGIN_SERVER }}
@@ -77,11 +78,9 @@ jobs:
           context: .
           push: false
           tags: |
-            ${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            ${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG_LATEST }}
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG_LATEST }}
           outputs: type=docker,dest=/tmp/image.tar
-          cache-from: type=registry,ref=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
 
       - name: 📤 Upload Docker image to runner
         uses: actions/upload-artifact@v4
@@ -107,6 +106,7 @@ jobs:
           category: 'trivy'
 
       - name: 🐳 Build and push Docker image to ACR
+        if: env.REGISTRY_USERNAME != ''
         id: docker-push
         uses: docker/build-push-action@v5
         with:
@@ -119,6 +119,7 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
 
       - name: 📝 Generate image metadata
+        if: env.REGISTRY_USERNAME != ''
         id: image-metadata
         run: |
           echo "image-uri=${{ env.REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
@@ -126,6 +127,7 @@ jobs:
           echo "pushed-at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
 
       - name: 📊 Display build summary
+        if: env.REGISTRY_USERNAME != ''
         run: |
           echo "## 🎉 CI Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
